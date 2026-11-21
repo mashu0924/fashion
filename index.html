@@ -21,11 +21,11 @@
         </a>
         <p class="eyebrow">YOUR WARDROBE, YOUR STORY</p>
         <h1 id="auth-title">クローゼットにログイン</h1>
-        <p class="auth-description">アカウントを作成して、あなただけのクローゼットを始めましょう。</p>
+        <p class="auth-description" id="auth-description">ログイン、またはこのアプリ内で新しいアカウントを作成できます。</p>
 
         <div class="auth-setup" id="auth-setup">
           <h2>Supabase プロジェクトに接続</h2>
-          <p>プロジェクトの URL と anon（公開）キーを入力してください。service_role キーは使用しないでください。</p>
+          <p>アプリ運営者向けの初回設定です。接続後、利用者はこのアプリ内でアカウントを作成できます。Project URL と anon（公開）キーを入力してください。service_role キーは使用しないでください。</p>
           <form id="config-form">
             <label class="field-label">Project URL<input name="projectUrl" type="url" placeholder="https://your-project.supabase.co" autocomplete="url" required></label>
             <label class="field-label">anon / publishable key<input name="publicKey" type="text" placeholder="sb_publishable_… または anon キー" autocomplete="off" required></label>

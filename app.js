@@ -213,13 +213,18 @@ function showAuthenticationForm() {
   $("#auth-title").textContent = recovering
     ? "新しいパスワードを設定"
     : authMode === "signup" ? "アカウントを作成" : "クローゼットにログイン";
+  $("#auth-description").textContent = recovering
+    ? "この画面で新しいパスワードを設定してください。"
+    : authMode === "signup"
+      ? "アカウント登録はこの画面で行います。メール確認が有効な場合は、届いたリンクから登録を完了してください。"
+      : "ログイン、またはこのアプリ内で新しいアカウントを作成できます。";
   $("#auth-submit").textContent = authMode === "signup" ? "アカウントを作成" : "ログイン";
   const passwordInput = $("[name='password']", $("#auth-form"));
   passwordInput.autocomplete = authMode === "signup" ? "new-password" : "current-password";
   passwordInput.minLength = authMode === "signup" ? 8 : 0;
   $("#auth-mode-button").textContent = authMode === "signup"
-    ? "すでにアカウントをお持ちの方はこちら"
-    : "アカウントをお持ちでない方はこちら";
+    ? "ログインに戻る"
+    : "アカウントを新規登録";
   $("#reset-password-button").hidden = authMode === "signup";
 }
 
