@@ -1,11 +1,17 @@
 "use strict";
 
-const STORAGE_KEY = "closet-note-data-v1";
+const STORAGE_PREFIX = "closet-note-data-v1:";
+const LEGACY_STORAGE_KEY = "closet-note-data-v1";
+const AUTH_CONFIG_KEY = "closet-note-supabase-config-v1";
 const categories = ["トップス", "ボトムス", "ワンピース", "アウター", "シューズ", "バッグ", "小物"];
 const fallbackPalettes = ["#d9dfd4", "#e7d8ca", "#d9dce0", "#e6dfc9", "#d5d9d0", "#e3d5d0", "#d9d4e0"];
 const emptyMark = "✳";
 
-let state = loadState();
+let state = { items: [], outfits: [] };
+let storageKey = "";
+let supabaseClient = null;
+let authMode = "signin";
+let recoveryMode = false;
 let pendingPhoto = "";
 let toastTimer;
 
@@ -16,9 +22,9 @@ const outfitsView = $("#outfits-view");
 const itemDialog = $("#item-dialog");
 const outfitDialog = $("#outfit-dialog");
 
-function loadState() {
+function loadState(savedData = null) {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    const saved = savedData === null ? localStorage.getItem(storageKey) : savedData;
     if (!saved) return { items: [], outfits: [] };
     const parsed = JSON.parse(saved);
     return {
@@ -43,8 +49,12 @@ function isValidOutfit(outfit) {
 }
 
 function saveState() {
+  if (!storageKey) {
+    showToast("ログインしてから保存してください。");
+    return false;
+  }
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(storageKey, JSON.stringify(state));
     return true;
   } catch (error) {
     console.error("クローゼットのデータを保存できませんでした。", error);
@@ -147,6 +157,157 @@ function showToast(message) {
   toastTimer = window.setTimeout(() => toast.classList.remove("show"), 2800);
 }
 
+function showAuthMessage(message, isError = false) {
+  const element = $("#auth-message");
+  element.textContent = message;
+  element.classList.toggle("error", isError);
+}
+
+function getAuthRedirectURL() {
+  return window.location.protocol === "http:" || window.location.protocol === "https:"
+    ? window.location.href.split(/[?#]/)[0]
+    : undefined;
+}
+
+function isPrivilegedApiKey(key) {
+  if (/service[_-]?role/i.test(key) || /^sb_secret_/i.test(key)) return true;
+  const tokenParts = key.split(".");
+  if (tokenParts.length !== 3) return false;
+  try {
+    const encodedPayload = tokenParts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const payload = JSON.parse(atob(encodedPayload.padEnd(Math.ceil(encodedPayload.length / 4) * 4, "=")));
+    return typeof payload.role === "string" && payload.role.toLowerCase() === "service_role";
+  } catch {
+    return false;
+  }
+}
+
+function makeSupabaseClient(projectUrl, publicKey) {
+  const parsedURL = new URL(projectUrl);
+  const isLocalHTTP = parsedURL.protocol === "http:" &&
+    (parsedURL.hostname === "localhost" || parsedURL.hostname === "127.0.0.1");
+  if (parsedURL.protocol !== "https:" && !isLocalHTTP) {
+    throw new Error("Project URL には HTTPS の URL を入力してください。");
+  }
+  if (!publicKey.trim() || isPrivilegedApiKey(publicKey.trim())) {
+    throw new Error("anon / publishable の公開キーを使用してください。service_role キーと sb_secret_ キーは使用できません。");
+  }
+  const sdk = window.supabase;
+  if (!sdk || typeof sdk.createClient !== "function") {
+    throw new Error("Supabase SDK を読み込めません。インターネット接続を確認して、ページを再読み込みしてください。");
+  }
+  return sdk.createClient(parsedURL.origin, publicKey.trim(), {
+    auth: { autoRefreshToken: true, persistSession: true, detectSessionInUrl: true },
+  });
+}
+
+function showAuthenticationForm() {
+  const configured = Boolean(supabaseClient);
+  const recovering = configured && recoveryMode;
+  $("#auth-setup").hidden = configured;
+  $("#auth-config-ready").hidden = !configured || recovering;
+  $("#auth-form").hidden = !configured || recovering;
+  $("#recovery-form").hidden = !recovering;
+  $("#auth-options").hidden = !configured || recovering;
+  $("#cancel-config-button").hidden = true;
+  $("#auth-title").textContent = recovering
+    ? "新しいパスワードを設定"
+    : authMode === "signup" ? "アカウントを作成" : "クローゼットにログイン";
+  $("#auth-submit").textContent = authMode === "signup" ? "アカウントを作成" : "ログイン";
+  const passwordInput = $("[name='password']", $("#auth-form"));
+  passwordInput.autocomplete = authMode === "signup" ? "new-password" : "current-password";
+  passwordInput.minLength = authMode === "signup" ? 8 : 0;
+  $("#auth-mode-button").textContent = authMode === "signup"
+    ? "すでにアカウントをお持ちの方はこちら"
+    : "アカウントをお持ちでない方はこちら";
+  $("#reset-password-button").hidden = authMode === "signup";
+}
+
+function loadUserState(user) {
+  storageKey = `${STORAGE_PREFIX}${user.id}`;
+  let saved = null;
+  try {
+    saved = localStorage.getItem(storageKey);
+    if (!saved) {
+      const legacyData = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacyData && window.confirm("このブラウザーに保存されている既存の洋服・コーデ記録を、このアカウント用に引き継ぎますか？記録はこの端末内に保存されます。")) {
+        localStorage.setItem(storageKey, legacyData);
+        saved = legacyData;
+      }
+    }
+  } catch (error) {
+    console.error("既存のクローゼットデータを確認できませんでした。", error);
+    showToast("既存データを読み込めませんでした。");
+  }
+  state = loadState(saved);
+  render();
+}
+
+function setAuthenticatedSession(session) {
+  if (recoveryMode) {
+    $("#app-shell").hidden = true;
+    $("#auth-screen").hidden = false;
+    return;
+  }
+  const user = session && session.user ? session.user : null;
+  if (!user) {
+    storageKey = "";
+    state = { items: [], outfits: [] };
+    $("#app-shell").hidden = true;
+    $("#auth-screen").hidden = false;
+    return;
+  }
+  $("#auth-screen").hidden = true;
+  $("#app-shell").hidden = false;
+  $("#user-email").textContent = user.email || "";
+  $("#user-email").title = user.email || "";
+  loadUserState(user);
+}
+
+function watchAuthenticationChanges(client) {
+  client.auth.onAuthStateChange((event, session) => {
+    if (event === "PASSWORD_RECOVERY") {
+      recoveryMode = true;
+      showAuthenticationForm();
+      showAuthMessage("パスワード再設定リンクを確認してください。");
+    }
+    setAuthenticatedSession(session);
+  });
+}
+
+async function initializeAuthentication() {
+  recoveryMode = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("type") === "recovery";
+  showAuthenticationForm();
+  let savedConfig = null;
+  try {
+    const storedConfig = localStorage.getItem(AUTH_CONFIG_KEY);
+    if (storedConfig) savedConfig = JSON.parse(storedConfig);
+  } catch (error) {
+    console.error("Supabase の接続設定を読み込めませんでした。", error);
+    showAuthMessage("Supabase の接続設定を読み込めません。接続情報を再設定してください。", true);
+  }
+
+  if (savedConfig && typeof savedConfig.projectUrl === "string" && typeof savedConfig.publicKey === "string") {
+    try {
+      supabaseClient = makeSupabaseClient(savedConfig.projectUrl, savedConfig.publicKey);
+    } catch (error) {
+      console.error("Supabase に接続できませんでした。", error);
+      showAuthMessage(error.message || "Supabase に接続できませんでした。", true);
+      return;
+    }
+    showAuthenticationForm();
+    watchAuthenticationChanges(supabaseClient);
+    try {
+      const { data, error } = await supabaseClient.auth.getSession();
+      if (error) throw error;
+      setAuthenticatedSession(data.session);
+    } catch (error) {
+      console.error("Supabase のセッションを確認できませんでした。", error);
+      showAuthMessage(error.message || "接続を確認できませんでした。再度お試しください。", true);
+    }
+  }
+}
+
 function openItemDialog() {
   $("#item-form").reset();
   $("#item-form-error").textContent = "";
@@ -194,7 +355,6 @@ async function prepareImage(file) {
 }
 
 $("#today-label").textContent = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric" });
-render();
 
 $$(".nav-link").forEach((link) => link.addEventListener("click", () => {
   const showCloset = link.dataset.view === "closet";
@@ -347,3 +507,160 @@ $("#outfits-grid").addEventListener("click", (event) => {
 
 $("#search-input").addEventListener("input", renderItems);
 $("#category-filter").addEventListener("change", renderItems);
+
+$("#auth-mode-button").addEventListener("click", () => {
+  authMode = authMode === "signin" ? "signup" : "signin";
+  $("#auth-form").reset();
+  showAuthMessage("");
+  showAuthenticationForm();
+});
+
+$("#change-config-button").addEventListener("click", () => {
+  try {
+    const savedConfig = JSON.parse(localStorage.getItem(AUTH_CONFIG_KEY) || "{}");
+    $("[name='projectUrl']", $("#config-form")).value = savedConfig.projectUrl || "";
+    $("[name='publicKey']", $("#config-form")).value = savedConfig.publicKey || "";
+  } catch (error) {
+    console.error("Supabase の接続設定を読み込めませんでした。", error);
+  }
+  $("#auth-setup").hidden = false;
+  $("#auth-config-ready").hidden = true;
+  $("#auth-form").hidden = true;
+  $("#auth-options").hidden = true;
+  $("#cancel-config-button").hidden = false;
+  showAuthMessage("");
+});
+
+$("#cancel-config-button").addEventListener("click", () => {
+  showAuthenticationForm();
+  showAuthMessage("");
+});
+
+$("#config-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+  const projectUrl = String(formData.get("projectUrl") || "").trim();
+  const publicKey = String(formData.get("publicKey") || "").trim();
+  const submitButton = $("button[type='submit']", form);
+  submitButton.disabled = true;
+  showAuthMessage("");
+  try {
+    const client = makeSupabaseClient(projectUrl, publicKey);
+    localStorage.setItem(AUTH_CONFIG_KEY, JSON.stringify({ projectUrl, publicKey }));
+    supabaseClient = client;
+    watchAuthenticationChanges(client);
+    showAuthenticationForm();
+    const { data, error } = await client.auth.getSession();
+    if (error) throw error;
+    setAuthenticatedSession(data.session);
+    showAuthMessage("接続しました。メールアドレスでログインまたはアカウントを作成してください。");
+  } catch (error) {
+    console.error("Supabase の設定に失敗しました。", error);
+    showAuthMessage(error.message || "接続できませんでした。入力内容とネットワークを確認してください。", true);
+  } finally {
+    submitButton.disabled = false;
+  }
+});
+
+$("#auth-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!supabaseClient) {
+    showAuthMessage("先に Supabase に接続してください。", true);
+    return;
+  }
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+  const email = String(formData.get("email") || "").trim();
+  const password = String(formData.get("password") || "");
+  const submitButton = $("#auth-submit");
+  submitButton.disabled = true;
+  showAuthMessage("");
+  try {
+    if (authMode === "signup") {
+      const { data, error } = await supabaseClient.auth.signUp({
+        email,
+        password,
+        options: { emailRedirectTo: getAuthRedirectURL() },
+      });
+      if (error) throw error;
+      if (data.session) {
+        showAuthMessage("アカウントを作成しました。");
+      } else {
+        showAuthMessage("確認メールを送信しました。メール内のリンクから登録を完了してください。");
+      }
+    } else {
+      const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+    }
+  } catch (error) {
+    console.error("認証に失敗しました。", error);
+    showAuthMessage(error.message || "認証に失敗しました。入力内容を確認してください。", true);
+  } finally {
+    submitButton.disabled = false;
+  }
+});
+
+$("#recovery-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!supabaseClient || !recoveryMode) return;
+  const formData = new FormData(event.currentTarget);
+  const newPassword = String(formData.get("newPassword") || "");
+  const confirmPassword = String(formData.get("confirmPassword") || "");
+  if (newPassword !== confirmPassword) {
+    showAuthMessage("入力したパスワードが一致しません。", true);
+    return;
+  }
+  const submitButton = $("button[type='submit']", event.currentTarget);
+  submitButton.disabled = true;
+  try {
+    const { data, error } = await supabaseClient.auth.updateUser({ password: newPassword });
+    if (error) throw error;
+    recoveryMode = false;
+    setAuthenticatedSession({ user: data.user });
+  } catch (error) {
+    console.error("パスワードを更新できませんでした。", error);
+    showAuthMessage(error.message || "パスワードを更新できませんでした。", true);
+  } finally {
+    submitButton.disabled = false;
+  }
+});
+
+$("#reset-password-button").addEventListener("click", async () => {
+  if (!supabaseClient) return;
+  const email = $("[name='email']", $("#auth-form")).value.trim();
+  if (!email) {
+    showAuthMessage("先にメールアドレスを入力してください。", true);
+    $("[name='email']", $("#auth-form")).focus();
+    return;
+  }
+  try {
+    const options = {};
+    const redirectURL = getAuthRedirectURL();
+    if (redirectURL) options.redirectTo = redirectURL;
+    const { error } = await supabaseClient.auth.resetPasswordForEmail(email, options);
+    if (error) throw error;
+    showAuthMessage("パスワード再設定のメールを送信しました。");
+  } catch (error) {
+    console.error("再設定メールを送信できませんでした。", error);
+    showAuthMessage(error.message || "メールを送信できませんでした。", true);
+  }
+});
+
+$("#signout-button").addEventListener("click", async () => {
+  if (!supabaseClient) return;
+  const button = $("#signout-button");
+  button.disabled = true;
+  try {
+    const { error } = await supabaseClient.auth.signOut();
+    if (error) throw error;
+    showAuthMessage("ログアウトしました。");
+  } catch (error) {
+    console.error("ログアウトに失敗しました。", error);
+    showToast(error.message || "ログアウトに失敗しました。");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+initializeAuthentication();
